@@ -7,6 +7,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
 #include <time.h>
+#include <U8g2_for_TFT_eSPI.h>   // 顯示中文股票名(WenQuanYi 點陣字,簡體 GB2312)
 
 // ---- CYD 觸控 ----
 #define XPT2046_IRQ  36
@@ -47,11 +48,12 @@ void setLED(bool r,bool g,bool b){
 SPIClass touchSPI = SPIClass(VSPI);
 XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 TFT_eSPI tft = TFT_eSPI();
+U8g2_for_TFT_eSPI u8f;           // 中文字體 wrapper(接住 tft)
 Preferences prefs;
 
-enum Tab { TAB_CRYPTO, TAB_STOCK, TAB_SETTING };
+enum Tab { TAB_CRYPTO, TAB_STOCK, TAB_METALS, TAB_SETTING };
 Tab curTab = TAB_CRYPTO;
-const char* tabNames[] = { "Crypto", "Stock", "Setup" };
+const char* tabNames[] = { "Crypto", "Stock", "Metals" };   // Setup 用齒輪 icon,唔用文字
 
 // ---- WiFi 設定(存 flash)----
 String wifiSSID = "";
@@ -80,10 +82,20 @@ uint32_t lastCrypto=0;
 
 // ---- Stock ----
 #define MAX_STOCK 20
-struct Stock { String sym; float price; float chg; bool ok; };
+struct Stock { String sym; float price; float chg; bool ok; String cname; bool nameOk; };
 Stock stocks[MAX_STOCK];
 int N_STOCK = 0;
 uint32_t lastStock=0;
+
+// ---- 貴金屬(Metals,COMEX 期貨報價)----
+struct Metal { const char* sym; const char* nameCN; float price; float chg; bool ok; };
+Metal metals[] = {
+  { "GC=F", "黄金", 0,0,false },   // 金
+  { "SI=F", "白银", 0,0,false },   // 銀
+  { "PL=F", "铂金", 0,0,false },   // 鉑金
+};
+const int N_METAL = sizeof(metals)/sizeof(metals[0]);
+uint32_t lastMetal=0;
 
 // ---- Stock scroll / layout ----
 int stockScroll = 0;
@@ -117,7 +129,10 @@ String kbRow(int r){
 void saveStocks(){
   prefs.begin("cfg", false);
   prefs.putInt("nStk", N_STOCK);
-  for(int i=0;i<N_STOCK;i++) prefs.putString(("s"+String(i)).c_str(), stocks[i].sym);
+  for(int i=0;i<N_STOCK;i++){
+    prefs.putString(("s"+String(i)).c_str(), stocks[i].sym);
+    prefs.putString(("n"+String(i)).c_str(), stocks[i].cname);   // 中文名快取
+  }
   prefs.end();
 }
 void loadStocks(){
@@ -127,14 +142,16 @@ void loadStocks(){
     prefs.end();
     const char* def[]={"0941.HK","0700.HK","AAPL"};
     N_STOCK=0;
-    for(auto s:def){ stocks[N_STOCK].sym=s; stocks[N_STOCK].ok=false; N_STOCK++; }
+    for(auto s:def){ stocks[N_STOCK].sym=s; stocks[N_STOCK].ok=false; stocks[N_STOCK].cname=""; stocks[N_STOCK].nameOk=false; N_STOCK++; }
     saveStocks();
     return;
   }
   N_STOCK=n;
   for(int i=0;i<N_STOCK;i++){
     stocks[i].sym=prefs.getString(("s"+String(i)).c_str(), "");
+    stocks[i].cname=prefs.getString(("n"+String(i)).c_str(), "");
     stocks[i].ok=false;
+    stocks[i].nameOk=(stocks[i].cname.length()>0);
   }
   prefs.end();
 }
@@ -163,7 +180,7 @@ bool addStock(String sym){
     sym=num+".HK";
   }
   for(int i=0;i<N_STOCK;i++) if(stocks[i].sym==sym) return false;
-  stocks[N_STOCK].sym=sym; stocks[N_STOCK].ok=false; N_STOCK++;
+  stocks[N_STOCK].sym=sym; stocks[N_STOCK].ok=false; stocks[N_STOCK].cname=""; stocks[N_STOCK].nameOk=false; N_STOCK++;
   saveStocks();                    // 🔑 加完即存
   return true;
 }
@@ -238,6 +255,35 @@ void fetchCrypto(){
   }
 
 }
+// 去除 Yahoo 名稱尾隨嘅股份類別後綴,例如「阿里巴巴－Ｗ」→「阿里巴巴」
+String stripShareSuffix(String s){
+  int idx = s.indexOf("\xEF\xBC\x8D");     // 全形破折號 "－"(EF BC 8D)
+  if(idx>0) s = s.substring(0, idx);
+  idx = s.indexOf('-');                    // 半形 "-"(少見)
+  if(idx>0) s = s.substring(0, idx);
+  s.trim();
+  return s;
+}
+
+// 攞 Yahoo 中文(簡體)公司名,cache 落 stocks[i].cname(只適用 .HK 股票)
+void fetchStockNameCN(int i){
+  if(!stocks[i].sym.endsWith(".HK")) return;
+  String body;
+  String url = "https://query1.finance.yahoo.com/v1/finance/search?q="+stocks[i].sym+
+               "&lang=zh-Hans-CN&region=CN&quotesCount=1&newsCount=0";
+  if(!httpsGet(url,body)) return;
+  StaticJsonDocument<96> f;
+  f["quotes"][0]["longname"]=true;
+  DynamicJsonDocument d(512);
+  if(deserializeJson(d,body,DeserializationOption::Filter(f))) return;
+  const char* name = d["quotes"][0]["longname"];
+  if(!name || !name[0]) return;
+  String cname = stripShareSuffix(String(name));
+  if(cname.length()==0) return;
+  stocks[i].cname = cname;
+  stocks[i].nameOk = true;
+  saveStocks();          // cache 落 flash,下次唔用再攞
+}
 void fetchOneStock(int i){
   String body;
   String url="https://query1.finance.yahoo.com/v8/finance/chart/"+stocks[i].sym;
@@ -256,8 +302,31 @@ void fetchOneStock(int i){
   stocks[i].price=p;
   stocks[i].chg=(prev>0)?(p-prev)/prev*100.0f:0;
   stocks[i].ok=true;
+  if(!stocks[i].nameOk) fetchStockNameCN(i);    // 冇攞過中文名先攞
 }
 void fetchStocks(){ for(int i=0;i<N_STOCK;i++){fetchOneStock(i);delay(100);} }
+
+// ================= 貴金屬 (Yahoo COMEX 期貨) =================
+void fetchOneMetal(int i){
+  String body;
+  String url="https://query1.finance.yahoo.com/v8/finance/chart/"+String(metals[i].sym);
+  if(!httpsGet(url,body)){metals[i].ok=false;return;}
+  StaticJsonDocument<256> f;
+  f["chart"]["result"][0]["meta"]["regularMarketPrice"]=true;
+  f["chart"]["result"][0]["meta"]["chartPreviousClose"]=true;
+  f["chart"]["result"][0]["meta"]["previousClose"]=true;
+  DynamicJsonDocument d(1024);
+  if(deserializeJson(d,body,DeserializationOption::Filter(f))){metals[i].ok=false;return;}
+  JsonObject m=d["chart"]["result"][0]["meta"];
+  if(m.isNull()){metals[i].ok=false;return;}
+  float p=m["regularMarketPrice"]|0.0f;
+  float prev=m["chartPreviousClose"]|(m["previousClose"]|0.0f);
+  if(p<=0){metals[i].ok=false;return;}
+  metals[i].price=p;
+  metals[i].chg=(prev>0)?(p-prev)/prev*100.0f:0;
+  metals[i].ok=true;
+}
+void fetchMetals(){ for(int i=0;i<N_METAL;i++){fetchOneMetal(i);delay(100);} }
 
 String nowHK(){
   struct tm t;
@@ -355,9 +424,21 @@ void drawTopBar(){
   }
 }
 
+// ===== 齒輪 icon (中心 cx,cy, 半徑 r) =====
+void drawGearIcon(int cx,int cy,int r,uint16_t col){
+  tft.drawCircle(cx,cy,r-3,col);
+  tft.fillCircle(cx,cy,2,col);
+  for(int a=0;a<360;a+=45){
+    float rad=a*3.14159/180;
+    int x1=cx+cos(rad)*(r-3), y1=cy+sin(rad)*(r-3);
+    int x2=cx+cos(rad)*r,     y2=cy+sin(rad)*r;
+    tft.drawLine(x1,y1,x2,y2,col);
+  }
+}
+
 void drawTabs(){
-  int w=320/3,y=24,h=26;
-  for(int i=0;i<3;i++){
+  int w=320/4,y=24,h=26;
+  for(int i=0;i<4;i++){
     int x=i*w;
     bool sel=(i==curTab);
     tft.fillRect(x+1,y,w-2,h,sel?C_DIM2:C_BG);
@@ -372,11 +453,17 @@ void drawTabs(){
       tft.drawFastVLine(x+2,y+h-6,6,C_CYAN);
       tft.drawFastVLine(x+w-3,y+h-6,6,C_CYAN);
     }
-    tft.setTextColor(sel?C_CYAN:C_DIM, sel?C_DIM2:C_BG);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(tabNames[i],x+w/2,y+h/2,2);
+    if(i<3){
+      tft.setTextColor(sel?C_CYAN:C_DIM, sel?C_DIM2:C_BG);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString(tabNames[i],x+w/2,y+h/2,2);
+    }else{
+      // 最右:Setup 用齒輪 icon 代替文字
+      drawGearIcon(x+w/2,y+h/2,8,sel?C_CYAN:C_DIM);
+    }
   }
 }
+
 
 
 // ======================================================
@@ -451,11 +538,27 @@ void drawStock(){
     tft.fillRect(2,y,3,STOCK_ROW_H-6,col);
     tft.fillRoundRect(8,y,298,STOCK_ROW_H-6,3,C_PANEL);
 
-    // 代號(粗字,左)
-    // 代號(粗字,左,升高)
-    tft.setFreeFont(&FreeSansBold12pt7b);
-    tft.setTextColor(C_CYAN,C_PANEL); tft.setTextDatum(TL_DATUM);
-    tft.drawString(stocks[i].sym, 16, y+14);       // baseline y+14(升高)
+    // 代號 / 中文名(左)
+    bool isHK = stocks[i].sym.endsWith(".HK");
+    if(isHK && stocks[i].nameOk && stocks[i].cname.length()>0){
+      // 中文名(WenQuanYi 點陣字,簡體,16px 大字,字庫最廣涵蓋)
+      u8f.setFont(u8g2_font_wqy16_t_gb2312b);
+      u8f.setFontMode(1);                    // 透明背景
+      u8f.setForegroundColor(C_CYAN);
+      u8f.setCursor(16, y+26);               // baseline,配合 16px 字體升高
+      u8f.print(stocks[i].cname);
+      int nameW = u8f.getUTF8Width(stocks[i].cname.c_str());
+
+      // " - 數字code"(細一半字體,貼住中文名後面)
+      String code = stocks[i].sym.substring(0, stocks[i].sym.indexOf('.'));
+      tft.setTextFont(1);
+      tft.setTextColor(C_DIM,C_PANEL); tft.setTextDatum(TL_DATUM);
+      tft.drawString(" - "+code, 16+nameW, y+18);
+    }else{
+      tft.setFreeFont(&FreeSansBold12pt7b);
+      tft.setTextColor(C_CYAN,C_PANEL); tft.setTextDatum(TL_DATUM);
+      tft.drawString(stocks[i].sym, 16, y+14);       // baseline y+14(升高)
+    }
 
     if(stocks[i].ok){
       // 價(粗字,右上)
@@ -574,6 +677,52 @@ void drawScanList(){
 }
 
 // ======================================================
+//  貴金屬畫面(黃金 / 白銀 / 鉑金,COMEX 期貨報價)
+// ======================================================
+void drawMetals(){
+  tft.fillRect(0,51,320,189,C_BG);
+  int y=58, rowH=63;
+  for(int i=0;i<N_METAL;i++){
+    bool up = metals[i].chg>=0;
+    uint16_t col = metals[i].ok?(up?C_GREEN:C_RED):C_DIM;
+
+    tft.fillRect(0,y,4,rowH-6,col);
+    tft.fillRoundRect(10,y,300,rowH-6,4,C_PANEL);
+    tft.drawRoundRect(10,y,300,rowH-6,4,C_DIM);
+
+    // 金屬名(簡體中文,WenQuanYi 點陣字,左)
+    u8f.setFont(u8g2_font_wqy16_t_gb2312b);
+    u8f.setFontMode(1);
+    u8f.setForegroundColor(C_CYAN);
+    u8f.setCursor(22, y+22);
+    u8f.print(metals[i].nameCN);
+
+    if(metals[i].ok){
+      // 價(粗字,右上)
+      tft.setFreeFont(&FreeSansBold12pt7b);
+      tft.setTextColor(col,C_PANEL); tft.setTextDatum(TR_DATUM);
+      char pb[20]; dtostrf(metals[i].price,0,2,pb);
+      tft.drawString(pb, 288, y+8);
+
+      // 三角:價格右邊
+      drawTriangle(300, y+16, up, col);
+
+      // %:價格下面,右對齊
+      tft.setTextFont(2);
+      char cb[16]; snprintf(cb,sizeof(cb),"%s%.2f%%",up?"+":"-",fabs(metals[i].chg));
+      tft.setTextColor(col,C_PANEL); tft.setTextDatum(TR_DATUM);
+      tft.drawString(cb, 300, y+38, 2);
+    }else{
+      tft.setTextFont(2);
+      tft.setTextColor(C_DIM,C_PANEL); tft.setTextDatum(TR_DATUM);
+      tft.drawString("-- no data --", 300, y+22, 2);
+    }
+    tft.setTextFont(2);
+    y+=rowH;
+  }
+}
+
+// ======================================================
 //  Setup 畫面
 // ======================================================
 void drawSetup(){
@@ -611,6 +760,7 @@ void drawSetup(){
 void drawContent(){
   if(curTab==TAB_CRYPTO) drawCrypto();
   else if(curTab==TAB_STOCK) drawStock();
+  else if(curTab==TAB_METALS) drawMetals();
   else drawSetup();
 }
 
@@ -687,7 +837,7 @@ void connectWiFi(){
     Serial.println("\nWiFi OK: "+WiFi.localIP().toString());
     configTime(8*3600,0,"pool.ntp.org","time.google.com");
     struct tm t; for(int i=0;i<10&&!getLocalTime(&t);i++) delay(500);
-    fetchWeather(); fetchCrypto(); fetchStocks();
+    fetchWeather(); fetchCrypto(); fetchStocks(); fetchMetals();
   }else{
     Serial.println("\nWiFi FAILED");
   }
@@ -769,6 +919,7 @@ void setup(){
 
   pinMode(TFT_BL,OUTPUT); digitalWrite(TFT_BL,HIGH);
   tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);
+  u8f.begin(tft);          // 接駁中文字體 wrapper
     // 開機 cyber 動畫
   tft.fillScreen(C_BG);
   tft.setTextColor(C_CYAN,C_BG); tft.setTextDatum(MC_DATUM);
@@ -893,8 +1044,8 @@ void loop(){
       wasDown=false;
       // --- tab 切換 ---
       if(downY>=22 && downY<50){
-        int w=320/3; Tab t=(Tab)(downX/w);
-        if(t>=0&&t<=2&&t!=curTab){ curTab=t; stockScroll=0; drawTabs(); drawContent(); }
+        int w=320/4; Tab t=(Tab)(downX/w);
+        if(t>=0&&t<=3&&t!=curTab){ curTab=t; stockScroll=0; drawTabs(); drawContent(); }
       }
       // --- Stock 頂部 Add 掣 ---
       else if(curTab==TAB_STOCK && !moved && downY>=STOCK_TOP+2 && downY<STOCK_TOP+26){
@@ -950,5 +1101,9 @@ void loop(){
   if(millis()-lastStock>60000 || (lastStock==0 && WiFi.status()==WL_CONNECTED)){
     if(WiFi.status()==WL_CONNECTED){ lastStock=millis(); fetchStocks();
       if(curTab==TAB_STOCK && kbMode==0) drawStock(); }
+  }
+  if(millis()-lastMetal>60000 || (lastMetal==0 && WiFi.status()==WL_CONNECTED)){
+    if(WiFi.status()==WL_CONNECTED){ lastMetal=millis(); fetchMetals();
+      if(curTab==TAB_METALS && kbMode==0) drawMetals(); }
   }
 }
