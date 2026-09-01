@@ -51,9 +51,9 @@ TFT_eSPI tft = TFT_eSPI();
 U8g2_for_TFT_eSPI u8f;           // 中文字體 wrapper(接住 tft)
 Preferences prefs;
 
-enum Tab { TAB_CRYPTO, TAB_STOCK, TAB_METALS, TAB_SETTING };
+enum Tab { TAB_WEATHER, TAB_CRYPTO, TAB_STOCK, TAB_METALS, TAB_SETTING };
 Tab curTab = TAB_CRYPTO;
-const char* tabNames[] = { "Crypto", "Stock", "Metals" };   // Setup 用齒輪 icon,唔用文字
+const char* tabNames[] = { "Weather", "Crypto", "Stock", "Metals" }; // Setup 用齒輪 icon,唔用文字
 
 // ---- WiFi 設定(存 flash)----
 String wifiSSID = "";
@@ -72,6 +72,10 @@ const int SCAN_VISIBLE = 5;     // 一屏顯示 5 個
 
 // ---- 天氣 ----
 float weatherTemp=0; int weatherCode=-1; bool weatherOk=false;
+const int WEATHER_FORECAST_HOURS=12;
+float weatherHourlyTemp[WEATHER_FORECAST_HOURS];
+int weatherHourlyCode[WEATHER_FORECAST_HOURS];
+int weatherHourlyCount=0;
 uint32_t lastWeather=0;
 
 // ---- Crypto ----
@@ -224,13 +228,21 @@ String weatherDesc(int c){
 }
 void fetchWeather(){
   String body;
-  if(!httpsGet("https://api.open-meteo.com/v1/forecast?latitude=22.30&longitude=114.17&current=temperature_2m,weather_code",body)){weatherOk=false;return;}
-  StaticJsonDocument<128> f;
+  if(!httpsGet("https://api.open-meteo.com/v1/forecast?latitude=22.30&longitude=114.17&current=temperature_2m,weather_code&hourly=temperature_2m,weather_code&forecast_hours=12",body)){weatherOk=false;weatherHourlyCount=0;return;}
+  StaticJsonDocument<192> f;
   f["current"]["temperature_2m"]=true; f["current"]["weather_code"]=true;
-  StaticJsonDocument<256> d;
-  if(deserializeJson(d,body,DeserializationOption::Filter(f))){weatherOk=false;return;}
+  f["hourly"]["temperature_2m"]=true; f["hourly"]["weather_code"]=true;
+  StaticJsonDocument<1024> d;
+  if(deserializeJson(d,body,DeserializationOption::Filter(f))){weatherOk=false;weatherHourlyCount=0;return;}
   weatherTemp=d["current"]["temperature_2m"]|0.0f;
   weatherCode=d["current"]["weather_code"]|-1;
+  JsonArray temps=d["hourly"]["temperature_2m"].as<JsonArray>();
+  JsonArray codes=d["hourly"]["weather_code"].as<JsonArray>();
+  weatherHourlyCount=min(WEATHER_FORECAST_HOURS,min((int)temps.size(),(int)codes.size()));
+  for(int i=0;i<weatherHourlyCount;i++){
+    weatherHourlyTemp[i]=temps[i]|0.0f;
+    weatherHourlyCode[i]=codes[i]|-1;
+  }
   weatherOk=true;
 }
 void fetchCrypto(){
@@ -334,47 +346,57 @@ String nowHK(){
   char b[8]; strftime(b,sizeof(b),"%H:%M",&t); return String(b);
 }
 
-// ===== 手繪天氣 icon (14x14 區域, 中心 cx,cy) =====
-void drawWeatherIcon(int cx, int cy, int code){
+// 以目前香港時間計算 n 小時後的 HH:MM，例如 13:22 + 3 小時 = 16:22
+String weatherForecastTime(int hoursFromNow){
+  time_t now=time(nullptr);
+  if(now<100000) return String("+")+String(hoursFromNow)+"H";
+  now+=hoursFromNow*3600;
+  struct tm t;
+  localtime_r(&now,&t);
+  char b[8]; strftime(b,sizeof(b),"%H:%M",&t); return String(b);
+}
+
+// ===== 手繪天氣 icon (14x14 區域, 中心 cx,cy, s=縮放比例) =====
+void drawWeatherIcon(int cx, int cy, int code, int s=1){
   uint16_t cc = 0xCE79;                        // 光灰色
   
   if(code==0){                                   // 晴:太陽
-    tft.fillCircle(cx,cy,5,C_YELLOW);
+    tft.fillCircle(cx,cy,5*s,C_YELLOW);
     for(int a=0;a<360;a+=45){
       float r=a*3.14159/180;
-      int x1=cx+cos(r)*7, y1=cy+sin(r)*7;
-      int x2=cx+cos(r)*9, y2=cy+sin(r)*9;
+      int x1=cx+cos(r)*7*s, y1=cy+sin(r)*7*s;
+      int x2=cx+cos(r)*9*s, y2=cy+sin(r)*9*s;
       tft.drawLine(x1,y1,x2,y2,C_YELLOW);
     }
   }else if(code<=3){                             // 多雲:雲
-    tft.fillCircle(cx-3,cy+2,4,cc);
-    tft.fillCircle(cx+3,cy+2,4,cc);
-    tft.fillCircle(cx,cy-1,5,cc);
-    tft.fillRect(cx-6,cy+2,12,4,cc);
+    tft.fillCircle(cx-3*s,cy+2*s,4*s,cc);
+    tft.fillCircle(cx+3*s,cy+2*s,4*s,cc);
+    tft.fillCircle(cx,cy-1*s,5*s,cc);
+    tft.fillRect(cx-6*s,cy+2*s,12*s,4*s,cc);
   }else if(code<=48){                            // 霧
     for(int i=0;i<4;i++)
-      tft.drawFastHLine(cx-7,cy-4+i*3,14,cc);
+      tft.drawFastHLine(cx-7*s,cy+(-4+i*3)*s,14*s,cc);
   }else if(code<=67 || (code>=80&&code<=82)){    // 雨
-    tft.fillCircle(cx-3,cy-2,4,cc);
-    tft.fillCircle(cx+3,cy-2,4,cc);
-    tft.fillCircle(cx,cy-5,5,cc);
-    tft.fillRect(cx-6,cy-2,12,3,cc);
-    tft.drawLine(cx-4,cy+3,cx-6,cy+7,C_CYAN);    // 雨點
-    tft.drawLine(cx,cy+3,cx-2,cy+7,C_CYAN);
-    tft.drawLine(cx+4,cy+3,cx+2,cy+7,C_CYAN);
+    tft.fillCircle(cx-3*s,cy-2*s,4*s,cc);
+    tft.fillCircle(cx+3*s,cy-2*s,4*s,cc);
+    tft.fillCircle(cx,cy-5*s,5*s,cc);
+    tft.fillRect(cx-6*s,cy-2*s,12*s,3*s,cc);
+    tft.drawLine(cx-4*s,cy+3*s,cx-6*s,cy+7*s,C_CYAN); // 雨點
+    tft.drawLine(cx,cy+3*s,cx-2*s,cy+7*s,C_CYAN);
+    tft.drawLine(cx+4*s,cy+3*s,cx+2*s,cy+7*s,C_CYAN);
   }else if(code<=77){                            // 雪
-    tft.fillCircle(cx,cy-3,5,cc);
-    tft.fillRect(cx-5,cy-3,10,3,cc);
+    tft.fillCircle(cx,cy-3*s,5*s,cc);
+    tft.fillRect(cx-5*s,cy-3*s,10*s,3*s,cc);
     tft.setTextColor(TFT_WHITE,C_BG); tft.setTextDatum(MC_DATUM);
-    tft.drawString("*",cx-3,cy+5,1);
-    tft.drawString("*",cx+3,cy+5,1);
+    tft.drawString("*",cx-3*s,cy+5*s,s==1?1:2);
+    tft.drawString("*",cx+3*s,cy+5*s,s==1?1:2);
   }else{                                         // 雷暴
-    tft.fillCircle(cx-3,cy-3,4,cc);
-    tft.fillCircle(cx+3,cy-3,4,cc);
-    tft.fillRect(cx-6,cy-3,12,3,cc);
-    tft.drawLine(cx,cy,cx-3,cy+5,C_YELLOW);      // 閃電
-    tft.drawLine(cx-3,cy+5,cx+1,cy+5,C_YELLOW);
-    tft.drawLine(cx+1,cy+5,cx-2,cy+9,C_YELLOW);
+    tft.fillCircle(cx-3*s,cy-3*s,4*s,cc);
+    tft.fillCircle(cx+3*s,cy-3*s,4*s,cc);
+    tft.fillRect(cx-6*s,cy-3*s,12*s,3*s,cc);
+    tft.drawLine(cx,cy,cx-3*s,cy+5*s,C_YELLOW);  // 閃電
+    tft.drawLine(cx-3*s,cy+5*s,cx+1*s,cy+5*s,C_YELLOW);
+    tft.drawLine(cx+1*s,cy+5*s,cx-2*s,cy+9*s,C_YELLOW);
   }
 }
 
@@ -437,8 +459,8 @@ void drawGearIcon(int cx,int cy,int r,uint16_t col){
 }
 
 void drawTabs(){
-  int w=320/4,y=24,h=26;
-  for(int i=0;i<4;i++){
+  int w=320/5,y=24,h=26;
+  for(int i=0;i<5;i++){
     int x=i*w;
     bool sel=(i==curTab);
     tft.fillRect(x+1,y,w-2,h,sel?C_DIM2:C_BG);
@@ -453,7 +475,7 @@ void drawTabs(){
       tft.drawFastVLine(x+2,y+h-6,6,C_CYAN);
       tft.drawFastVLine(x+w-3,y+h-6,6,C_CYAN);
     }
-    if(i<3){
+    if(i<4){
       tft.setTextColor(sel?C_CYAN:C_DIM, sel?C_DIM2:C_BG);
       tft.setTextDatum(MC_DATUM);
       tft.drawString(tabNames[i],x+w/2,y+h/2,2);
@@ -465,6 +487,52 @@ void drawTabs(){
 }
 
 
+
+// ======================================================
+//  Weather 畫面
+// ======================================================
+void drawWeather(){
+  tft.fillRect(0,51,320,189,C_BG);
+  tft.setTextColor(C_CYAN,C_BG); tft.setTextDatum(TL_DATUM);
+  tft.drawString("HONG KONG WEATHER",24,58,2);
+
+  if(!weatherOk){
+    tft.setTextColor(C_DIM,C_BG); tft.setTextDatum(MC_DATUM);
+    tft.drawString("-- no weather data --",160,140,2);
+    return;
+  }
+
+  tft.fillRoundRect(10,80,300,55,4,C_PANEL);
+  tft.drawRoundRect(10,80,300,55,4,C_DIM);
+  drawWeatherIcon(48,107,weatherCode,2);
+  tft.setTextColor(C_YELLOW,C_PANEL); tft.setTextDatum(ML_DATUM);
+  tft.drawString(String(weatherTemp,0)+"C",82,101,4);
+  tft.setTextColor(C_CYAN,C_PANEL); tft.setTextDatum(ML_DATUM);
+  tft.drawString(weatherDesc(weatherCode),82,121,2);
+  tft.setTextColor(C_DIM,C_PANEL); tft.setTextDatum(MR_DATUM);
+  tft.drawString("Now",292,107,2);
+
+  tft.setTextColor(C_CYAN,C_BG); tft.setTextDatum(TL_DATUM);
+  tft.drawString("NEXT HOURS",12,147,2);
+  const int forecastSlots[]={2,5,8,11};
+  const int forecastHours[]={3,6,9,12};
+  for(int i=0;i<4;i++){
+    int x=8+i*78;
+    bool hasForecast=forecastSlots[i]<weatherHourlyCount;
+    tft.fillRoundRect(x,166,70,67,3,C_PANEL);
+    tft.drawRoundRect(x,166,70,67,3,C_DIM2);
+    tft.setTextColor(C_CYAN,C_PANEL); tft.setTextDatum(MC_DATUM);
+    tft.drawString(weatherForecastTime(forecastHours[i]),x+35,177,1);
+    if(hasForecast){
+      drawWeatherIcon(x+35,196,weatherHourlyCode[forecastSlots[i]]);
+      tft.setTextColor(C_YELLOW,C_PANEL); tft.setTextDatum(MC_DATUM);
+      tft.drawString(String(weatherHourlyTemp[forecastSlots[i]],0)+"C",x+35,218,2);
+    }else{
+      tft.setTextColor(C_DIM,C_PANEL); tft.setTextDatum(MC_DATUM);
+      tft.drawString("--",x+35,203,2);
+    }
+  }
+}
 
 // ======================================================
 //  Crypto 畫面
@@ -758,7 +826,8 @@ void drawSetup(){
 //  內容分派
 // ======================================================
 void drawContent(){
-  if(curTab==TAB_CRYPTO) drawCrypto();
+  if(curTab==TAB_WEATHER) drawWeather();
+  else if(curTab==TAB_CRYPTO) drawCrypto();
   else if(curTab==TAB_STOCK) drawStock();
   else if(curTab==TAB_METALS) drawMetals();
   else drawSetup();
@@ -1044,8 +1113,8 @@ void loop(){
       wasDown=false;
       // --- tab 切換 ---
       if(downY>=22 && downY<50){
-        int w=320/4; Tab t=(Tab)(downX/w);
-        if(t>=0&&t<=3&&t!=curTab){ curTab=t; stockScroll=0; drawTabs(); drawContent(); }
+        int w=320/5; Tab t=(Tab)(downX/w);
+        if(t>=0&&t<=4&&t!=curTab){ curTab=t; stockScroll=0; drawTabs(); drawContent(); }
       }
       // --- Stock 頂部 Add 掣 ---
       else if(curTab==TAB_STOCK && !moved && downY>=STOCK_TOP+2 && downY<STOCK_TOP+26){
@@ -1092,6 +1161,7 @@ void loop(){
     lastWeather=millis();
     fetchWeather();
     drawTopBar();
+    if(curTab==TAB_WEATHER && kbMode==0) drawWeather();
   }
 
   if(millis()-lastCrypto>15000 || (lastCrypto==0 && WiFi.status()==WL_CONNECTED)){
