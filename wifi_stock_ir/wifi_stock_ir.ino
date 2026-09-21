@@ -48,6 +48,8 @@ static constexpr float IR_TA_SHIFT = 8.0F;
 static constexpr int IR_PIXELS_W = 32;
 static constexpr int IR_PIXELS_H = 24;
 static constexpr int IR_PIXEL_COUNT = IR_PIXELS_W * IR_PIXELS_H;
+static constexpr uint32_t IR_FRAME_INTERVAL_MS = 3000;
+static constexpr uint32_t IR_LIVE_TIMEOUT_MS = 5000;
 
 
 // ---- 內建 RGB LED ----
@@ -82,6 +84,7 @@ bool irLastReadOk = false;
 uint32_t irLastFrameAt = 0;
 uint32_t irFrameCount = 0;
 uint32_t irLastRetryAt = 0;
+uint32_t irLastAttemptAt = 0;
 String irError = "Starting I2C sensor...";
 
 // ---- WiFi 設定(存 flash)----
@@ -550,7 +553,7 @@ void drawIRDetect(){
   // Native pixels only: after 90-degree rotation, 24 columns x 32 rows.
   // Each sensor pixel is a crisp 10x10 block; no bilinear interpolation.
   tft.fillScreen(C_BG);
-  bool live=irSensorReady&&irLastReadOk&&millis()-irLastFrameAt<2000;
+  bool live=irSensorReady&&irLastReadOk&&millis()-irLastFrameAt<IR_LIVE_TIMEOUT_MS;
   uint16_t state=live?C_GREEN:C_RED;
   if(!irSensorReady||!irLastReadOk){
     tft.setTextColor(C_CYAN,C_BG);tft.setTextDatum(MC_DATUM);tft.drawString("IR // MLX90640 I2C",160,70,2);
@@ -1110,20 +1113,6 @@ void setup(){
 //  loop
 // ======================================================
 void loop(){
-  // MLX I2C acquisition remains active in every tab. Reinitialise after errors.
-  if(!irSensorReady){
-    if(millis()-irLastRetryAt>2000){
-      irLastRetryAt=millis();
-      irSensorReady=initIRSensor();
-      irLastReadOk=false;
-      if(curTab==TAB_IR) drawIRDetect();
-    }
-  }else{
-    irLastReadOk=readIRFrame();
-    if(!irLastReadOk) irSensorReady=false;
-    if(curTab==TAB_IR) drawIRDetect();
-  }
-
   // ===== 鍵盤模式 =====
   if(kbMode!=0){
     static bool kbDown=false;
@@ -1256,6 +1245,27 @@ void loop(){
           doScan(); drawScanList();            // Scan WiFi
         }
       }
+    }
+  }
+
+  // IR is intentionally inactive outside the IR tab. Touch is handled above
+  // first, so tapping BACK can leave IR before another blocking frame read starts.
+  // While IR is open, acquire one complete 32x24 frame every 3 seconds.
+  if(curTab==TAB_IR && kbMode==0 && !scanActive){
+    uint32_t now=millis();
+    if(!irSensorReady){
+      if(now-irLastRetryAt>=IR_FRAME_INTERVAL_MS){
+        irLastRetryAt=now;
+        irSensorReady=initIRSensor();
+        irLastReadOk=false;
+        if(irSensorReady) irLastAttemptAt=0; // Read the first frame immediately.
+        else drawIRDetect();
+      }
+    }else if(irLastAttemptAt==0 || now-irLastAttemptAt>=IR_FRAME_INTERVAL_MS){
+      irLastAttemptAt=now;
+      irLastReadOk=readIRFrame();
+      if(!irLastReadOk) irSensorReady=false;
+      drawIRDetect();
     }
   }
 
