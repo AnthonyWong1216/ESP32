@@ -1,0 +1,66 @@
+# -----------------------------------------------------------------------------
+# Local vendor packages, manuals and reference archives
+# Keep these on this computer, but never upload them to Git.
+# -----------------------------------------------------------------------------
+/MLX90640_USART_IIC/
+/MLX90640_USART_IIC.zip
+
+# Documentation and office files
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+
+# Archives and disk images
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.iso
+*.img
+
+# Prebuilt programs, libraries and firmware images
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.bin
+*.hex
+*.elf
+*.axf
+
+# Compiler, linker and IDE build output
+*.o
+*.obj
+*.d
+*.dep
+*.map
+*.lst
+*.lnp
+*.crf
+*.bak
+*.tmp
+*.log
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# Arduino-generated output and temporary sketches
+*.ino.bin
+*.ino.bootloader.bin
+*.ino.elf
+*.ino.map
+*.ino.partitions.bin
+sketch_*/
+
+# Operating-system clutter
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -7,7 +7,10 @@
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
 #include <time.h>
+#include <Wire.h>
 #include <U8g2_for_TFT_eSPI.h>   // 顯示中文股票名(WenQuanYi 點陣字,簡體 GB2312)
+#include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"
 
 // ---- CYD 觸控 ----
 #define XPT2046_IRQ  36
@@ -32,6 +35,20 @@
 #define C_PANEL   0x0841        // 面板底(極深藍)
 #define C_LINE    0x2145        // 分隔線
 
+// ---- MLX90640 I2C thermal camera ----
+// Confirmed wiring: GPIO23(SDA) -> module pin labelled SCL;
+// GPIO18(SCL) -> module pin labelled SDA; CYD 5V -> VIN; GND -> GND and PS.
+// RXD/TXD are unused. PS must remain connected to GND (I2C mode).
+static constexpr uint8_t IR_MLX_ADDRESS = 0x33;
+static constexpr uint8_t IR_I2C_SDA = 23;
+static constexpr uint8_t IR_I2C_SCL = 18;
+static constexpr uint32_t IR_I2C_CLOCK_HZ = 100000;
+static constexpr float IR_EMISSIVITY = 0.95F;
+static constexpr float IR_TA_SHIFT = 8.0F;
+static constexpr int IR_PIXELS_W = 32;
+static constexpr int IR_PIXELS_H = 24;
+static constexpr int IR_PIXEL_COUNT = IR_PIXELS_W * IR_PIXELS_H;
+
 
 // ---- 內建 RGB LED ----
 #define LED_R 4
@@ -51,9 +68,21 @@ TFT_eSPI tft = TFT_eSPI();
 U8g2_for_TFT_eSPI u8f;           // 中文字體 wrapper(接住 tft)
 Preferences prefs;
 
-enum Tab { TAB_WEATHER, TAB_CRYPTO, TAB_STOCK, TAB_METALS, TAB_SETTING };
+enum Tab { TAB_IR, TAB_WEATHER, TAB_CRYPTO, TAB_STOCK, TAB_METALS, TAB_SETTING };
 Tab curTab = TAB_CRYPTO;
-const char* tabNames[] = { "Weather", "Crypto", "Stock", "Metals" }; // Setup 用齒輪 icon,唔用文字
+const char* tabNames[] = { "IR", "Weather", "Crypto", "Stock", "Metals" }; // Setup 用齒輪 icon,唔用文字
+
+paramsMLX90640 irMlx;
+uint16_t irEeData[832];
+uint16_t irFrameData[834];
+float irTemperatures[IR_PIXEL_COUNT];
+float irMaxTemp = 0, irMinTemp = 0, irAverageTemp = 0, irCenterTemp = 0, irAmbientTemp = 0;
+bool irSensorReady = false;
+bool irLastReadOk = false;
+uint32_t irLastFrameAt = 0;
+uint32_t irFrameCount = 0;
+uint32_t irLastRetryAt = 0;
+String irError = "Starting I2C sensor...";
 
 // ---- WiFi 設定(存 flash)----
 String wifiSSID = "";
@@ -259,11 +288,9 @@ void fetchCrypto(){
   }
     // 用第一隻幣(BTC)控制燈
   if(coins[0].ok){
-    Serial.printf("[LED] BTC chg=%.3f -> %s\n", coins[0].chg, (coins[0].chg>=0)?"GREEN":"RED");
     if(coins[0].chg >= 0) setLED(0,1,0);   // 升 → 綠
     else                  setLED(1,0,0);   // 跌 → 紅
   }else{
-    Serial.println("[LED] BTC fetch failed, LED unchanged");
   }
 
 }
@@ -429,7 +456,6 @@ void drawTopBar(){
   // 左上角科技角位
   tft.drawFastHLine(0,0,12,C_CYAN);
   tft.drawFastVLine(0,0,8,C_CYAN);
-  Serial.printf("weatherOk=%d code=%d\n", weatherOk, weatherCode);
 
   // 時間(青色)
   tft.setTextColor(C_CYAN,C_PANEL); tft.setTextDatum(ML_DATUM);
@@ -459,8 +485,8 @@ void drawGearIcon(int cx,int cy,int r,uint16_t col){
 }
 
 void drawTabs(){
-  int w=320/5,y=24,h=26;
-  for(int i=0;i<5;i++){
+  int w=320/6,y=24,h=26;
+  for(int i=0;i<6;i++){
     int x=i*w;
     bool sel=(i==curTab);
     tft.fillRect(x+1,y,w-2,h,sel?C_DIM2:C_BG);
@@ -475,7 +501,7 @@ void drawTabs(){
       tft.drawFastVLine(x+2,y+h-6,6,C_CYAN);
       tft.drawFastVLine(x+w-3,y+h-6,6,C_CYAN);
     }
-    if(i<4){
+    if(i<5){
       tft.setTextColor(sel?C_CYAN:C_DIM, sel?C_DIM2:C_BG);
       tft.setTextDatum(MC_DATUM);
       tft.drawString(tabNames[i],x+w/2,y+h/2,2);
@@ -486,7 +512,72 @@ void drawTabs(){
   }
 }
 
-
+// ======================================================
+//  MLX90640 I2C thermal image
+// ======================================================
+uint16_t thermalColor(float value,float low,float high){
+  float ratio=constrain((value-low)/max(0.1f,high-low),0.0f,1.0f); uint8_t r,g,b;
+  if(ratio<.25f){r=0;g=(uint8_t)(ratio*1020);b=255;} else if(ratio<.5f){r=0;g=255;b=(uint8_t)((.5f-ratio)*1020);}
+  else if(ratio<.75f){r=(uint8_t)((ratio-.5f)*1020);g=255;b=0;} else {r=255;g=(uint8_t)((1-ratio)*1020);b=0;}
+  return tft.color565(r,g,b);
+}
+float irSample(float sx,float sy){
+  sx=constrain(sx,0.0f,float(IR_PIXELS_W-1)); sy=constrain(sy,0.0f,float(IR_PIXELS_H-1));
+  int x0=int(sx),y0=int(sy),x1=min(x0+1,IR_PIXELS_W-1),y1=min(y0+1,IR_PIXELS_H-1); float fx=sx-x0,fy=sy-y0;
+  float top=irTemperatures[y0*IR_PIXELS_W+x0]*(1-fx)+irTemperatures[y0*IR_PIXELS_W+x1]*fx;
+  float bot=irTemperatures[y1*IR_PIXELS_W+x0]*(1-fx)+irTemperatures[y1*IR_PIXELS_W+x1]*fx;
+  return top*(1-fy)+bot*fy;
+}
+bool initIRSensor(){
+  Wire.begin(IR_I2C_SDA,IR_I2C_SCL); Wire.setClock(IR_I2C_CLOCK_HZ); Wire.setTimeOut(100);
+  Wire.beginTransmission(IR_MLX_ADDRESS); if(Wire.endTransmission()!=0){irError="No I2C response at 0x33";return false;}
+  int rc=MLX90640_DumpEE(IR_MLX_ADDRESS,irEeData); if(rc){irError="EEPROM read error "+String(rc);return false;}
+  rc=MLX90640_ExtractParameters(irEeData,&irMlx); if(rc){irError="Calibration error "+String(rc);return false;}
+  if(MLX90640_SetRefreshRate(IR_MLX_ADDRESS,0x03)||MLX90640_SetChessMode(IR_MLX_ADDRESS)){irError="Sensor config error";return false;}
+  irError=""; return true;
+}
+bool readIRFrame(){
+  for(uint8_t page=0;page<2;page++){
+    int rc=MLX90640_GetFrameData(IR_MLX_ADDRESS,irFrameData); if(rc<0){irError="Frame read error "+String(rc);return false;}
+    irAmbientTemp=MLX90640_GetTa(irFrameData,&irMlx);
+    MLX90640_CalculateTo(irFrameData,&irMlx,IR_EMISSIVITY,irAmbientTemp-IR_TA_SHIFT,irTemperatures);
+  }
+  irMinTemp=irMaxTemp=irTemperatures[0]; float sum=0;
+  for(int i=0;i<IR_PIXEL_COUNT;i++){irMinTemp=min(irMinTemp,irTemperatures[i]);irMaxTemp=max(irMaxTemp,irTemperatures[i]);sum+=irTemperatures[i];}
+  irAverageTemp=sum/IR_PIXEL_COUNT; irCenterTemp=irTemperatures[12*IR_PIXELS_W+16]; irLastFrameAt=millis(); irFrameCount++; return true;
+}
+void drawIRDetect(){
+  // Native pixels only: after 90-degree rotation, 24 columns x 32 rows.
+  // Each sensor pixel is a crisp 10x10 block; no bilinear interpolation.
+  tft.fillScreen(C_BG);
+  bool live=irSensorReady&&irLastReadOk&&millis()-irLastFrameAt<2000;
+  uint16_t state=live?C_GREEN:C_RED;
+  if(!irSensorReady||!irLastReadOk){
+    tft.setTextColor(C_CYAN,C_BG);tft.setTextDatum(MC_DATUM);tft.drawString("IR // MLX90640 I2C",160,70,2);
+    tft.setTextColor(C_YELLOW,C_BG);tft.drawString(irError,160,128,2);
+    tft.setTextColor(C_DIM,C_BG);tft.drawString("PS->GND  I2C: 23/18",160,154,1);
+    tft.drawString("Tap top-right BACK",160,184,1);return;
+  }
+  const int ix=2,iy=0,cell=10;
+  float mid=(irMinTemp+irMaxTemp)*.5f,range=max(8.0f,irMaxTemp-irMinTemp),low=mid-range*.5f,high=mid+range*.5f;
+  // Output is 24x32. This keeps the same final orientation as the prior 90-degree view.
+  tft.startWrite();
+  for(int row=0;row<IR_PIXELS_W;row++) for(int col=0;col<IR_PIXELS_H;col++){
+    float temperature=irTemperatures[(IR_PIXELS_H-1-col)*IR_PIXELS_W+(IR_PIXELS_W-1-row)];
+    tft.fillRect(ix+col*cell,iy+row*cell,cell,cell,thermalColor(temperature,low,high));
+  }
+  tft.endWrite(); tft.fillRect(242,0,2,320,C_DIM);
+  tft.fillRect(244,0,76,320,C_BG); tft.fillRoundRect(248,4,68,18,3,C_DIM2);tft.drawRoundRect(248,4,68,18,3,C_CYAN);
+  tft.setTextDatum(MC_DATUM);tft.setTextColor(C_CYAN,C_DIM2);tft.drawString("BACK",282,13,1);
+  tft.fillCircle(312,31,3,state);tft.setTextColor(state,C_BG);tft.drawString(live?"LIVE":"ERR",276,31,1);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_YELLOW,C_BG);tft.drawString("MAX",248,49,1);tft.setTextColor(TFT_WHITE,C_BG);tft.drawString(String(irMaxTemp,1),248,62,2);
+  tft.setTextColor(C_CYAN,C_BG);tft.drawString("MIN",248,94,1);tft.drawString(String(irMinTemp,1),248,107,2);
+  tft.setTextColor(C_GREEN,C_BG);tft.drawString("AVG",248,139,1);tft.drawString(String(irAverageTemp,1),248,152,2);
+  tft.setTextColor(C_MAGENTA,C_BG);tft.drawString("MID",248,184,1);tft.drawString(String(irCenterTemp,1),248,197,2);
+  tft.setTextColor(C_YELLOW,C_BG);tft.drawString("AMB",248,229,1);tft.drawString(String(irAmbientTemp,1),248,242,2);
+  tft.setTextColor(C_DIM,C_BG);tft.drawString("F "+String(irFrameCount),248,286,1);tft.drawString(String(low,0)+"-"+String(high,0),248,303,1);
+}
 
 // ======================================================
 //  Weather 畫面
@@ -826,7 +917,8 @@ void drawSetup(){
 //  內容分派
 // ======================================================
 void drawContent(){
-  if(curTab==TAB_WEATHER) drawWeather();
+  if(curTab==TAB_IR) drawIRDetect();
+  else if(curTab==TAB_WEATHER) drawWeather();
   else if(curTab==TAB_CRYPTO) drawCrypto();
   else if(curTab==TAB_STOCK) drawStock();
   else if(curTab==TAB_METALS) drawMetals();
@@ -899,16 +991,14 @@ void connectWiFi(){
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
   uint32_t t0=millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){ delay(300); Serial.print("."); }
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){ delay(300); }
 
   tft.fillScreen(TFT_BLACK);
   if(WiFi.status()==WL_CONNECTED){
-    Serial.println("\nWiFi OK: "+WiFi.localIP().toString());
     configTime(8*3600,0,"pool.ntp.org","time.google.com");
     struct tm t; for(int i=0;i<10&&!getLocalTime(&t);i++) delay(500);
     fetchWeather(); fetchCrypto(); fetchStocks(); fetchMetals();
   }else{
-    Serial.println("\nWiFi FAILED");
   }
   drawTopBar(); drawTabs(); drawContent();
 }
@@ -981,9 +1071,9 @@ void setup(){
   setLED(0,0,0);   // 全熄
 
   // ---- LED 自我測試:開機逐一亮 R -> G -> B,用嚴查硬體/接線 ----
-  Serial.println("[LED TEST] RED on");   setLED(1,0,0); delay(600);
-  Serial.println("[LED TEST] GREEN on"); setLED(0,1,0); delay(600);
-  Serial.println("[LED TEST] BLUE on");  setLED(0,0,1); delay(600);
+  setLED(1,0,0); delay(600);
+  setLED(0,1,0); delay(600);
+  setLED(0,0,1); delay(600);
   setLED(0,0,0);
 
   pinMode(TFT_BL,OUTPUT); digitalWrite(TFT_BL,HIGH);
@@ -1020,6 +1110,20 @@ void setup(){
 //  loop
 // ======================================================
 void loop(){
+  // MLX I2C acquisition remains active in every tab. Reinitialise after errors.
+  if(!irSensorReady){
+    if(millis()-irLastRetryAt>2000){
+      irLastRetryAt=millis();
+      irSensorReady=initIRSensor();
+      irLastReadOk=false;
+      if(curTab==TAB_IR) drawIRDetect();
+    }
+  }else{
+    irLastReadOk=readIRFrame();
+    if(!irLastReadOk) irSensorReady=false;
+    if(curTab==TAB_IR) drawIRDetect();
+  }
+
   // ===== 鍵盤模式 =====
   if(kbMode!=0){
     static bool kbDown=false;
@@ -1112,9 +1216,13 @@ void loop(){
     if(wasDown){
       wasDown=false;
       // --- tab 切換 ---
-      if(downY>=22 && downY<50){
-        int w=320/5; Tab t=(Tab)(downX/w);
-        if(t>=0&&t<=4&&t!=curTab){ curTab=t; stockScroll=0; drawTabs(); drawContent(); }
+      // IR view owns the entire screen: use its BACK button before normal tab hit-testing.
+      if(curTab==TAB_IR && downX>=244 && downY<=30){
+        curTab=TAB_CRYPTO; drawTopBar(); drawTabs(); drawContent();
+      }
+      else if(downY>=22 && downY<50){
+        int w=320/6; Tab t=(Tab)(downX/w);
+        if(t>=0&&t<=5&&t!=curTab){ curTab=t; stockScroll=0; drawTabs(); drawContent(); }
       }
       // --- Stock 頂部 Add 掣 ---
       else if(curTab==TAB_STOCK && !moved && downY>=STOCK_TOP+2 && downY<STOCK_TOP+26){

@@ -4,7 +4,7 @@ A touchscreen market dashboard for an **ESP32 CYD (Cheap Yellow Display)**. It p
 
 The firmware is designed for a 320 × 240 ESP32 display with an XPT2046 touch controller. Wi-Fi credentials and the watchlist are configured directly on the device and persisted in ESP32 flash.
 
-> The current application source is [`wifi_stocks_4.cpp`](wifi_stocks_4.cpp).
+> The current application sketch is [`wifi_stock_ir/wifi_stock_ir.ino`](wifi_stock_ir/wifi_stock_ir.ino).
 
 ## Features
 
@@ -15,7 +15,8 @@ The firmware is designed for a 320 × 240 ESP32 display with an XPT2046 touch co
 - **Hong Kong weather and time** — Current temperature/weather for Hong Kong and NTP-synchronised local time (UTC+8).
 - **On-device Wi-Fi configuration** — Scan networks and enter SSID/password through the touchscreen keyboard.
 - **Persistent settings** — Wi-Fi credentials and the stock watchlist are saved using ESP32 `Preferences` (NVS).
-- **Touch controls** — Add/delete stocks, scroll the watchlist, and switch between Crypto, Stock, Metals, and Setup tabs.
+- **IR thermal camera** — The **IR** tab reads the MLX90640 over I2C and displays its native 32 × 24 thermal pixels rotated 90°.
+- **Touch controls** — Add/delete stocks, scroll the watchlist, and switch between IR, Crypto, Stock, Metals, and Setup tabs.
 - **RGB status LED** — After a BTC update, green represents non-negative BTC 24-hour change and red represents a negative change.
 
 ## Hardware
@@ -48,6 +49,20 @@ TOUCH_Y_MIN = 438    TOUCH_Y_MAX = 3781
 
 These values are hardware-specific. If touch positions do not line up with the display, recalibrate them for your board. [`define_setting.c`](define_setting.c) contains the same calibration reference values.
 
+### MLX90640 I2C wiring
+
+The confirmed wiring uses GPIO23/GPIO18. This module revision has its printed SDA/SCL labels reversed:
+
+| MLX90640 module signal | CYD connection |
+| --- | ---: |
+| Pin labelled `SCL` (actual SDA) | GPIO23 |
+| Pin labelled `SDA` (actual SCL) | GPIO18 |
+| VIN | 5V |
+| GND | GND |
+| PS | GND (selects I2C mode) |
+
+Leave module `RXD` and `TXD` disconnected. With PS grounded, the module's green LED should not flash. The sensor uses 7-bit I2C address `0x33`.
+
 ## Software requirements
 
 Use the Arduino framework for ESP32 and install these libraries through Arduino Library Manager (or your preferred Arduino-compatible workflow):
@@ -64,6 +79,7 @@ The following are provided by the ESP32 Arduino core:
 - `WiFiClientSecure`
 - `Preferences`
 - `SPI`
+- `Wire`
 - `time`
 
 ## Installation and upload
@@ -71,8 +87,8 @@ The following are provided by the ESP32 Arduino core:
 1. Install the **ESP32 by Espressif Systems** board package in the Arduino IDE.
 2. Install the libraries listed in [Software requirements](#software-requirements).
 3. Configure `TFT_eSPI` for your specific display driver and display pins. This configuration is intentionally external to this repository because `TFT_eSPI` stores it in its library setup files.
-4. Arduino sketches normally require a folder and `.ino` file with matching names. Create a folder named `wifi_stocks_4`, copy `wifi_stocks_4.cpp` into it, and rename the copy to `wifi_stocks_4.ino`.
-5. Open `wifi_stocks_4.ino` in Arduino IDE.
+4. Open [`wifi_stock_ir/wifi_stock_ir.ino`](wifi_stock_ir/wifi_stock_ir.ino) in Arduino IDE. Keep all MLX90640 API and I2C driver files in that sketch folder.
+5. Verify that Arduino IDE shows the `wifi_stock_ir` sketch rather than an unsaved temporary sketch.
 6. Select the ESP32 board and the correct serial port, then build and upload.
 7. On first boot, open the **Setup** tab:
    - Tap the SSID field and enter your Wi-Fi network name.
@@ -86,6 +102,7 @@ Once connected, the firmware synchronises time and retrieves data automatically.
 | Tab | Purpose |
 | --- | --- |
 | **Crypto** | BTC and ETH price information and 24-hour change. |
+| **IR** | Native-pixel MLX90640 thermal image over I2C, rotated 90°, with minimum, maximum, average, centre, and ambient temperatures. |
 | **Stock** | Scroll the watchlist; use **Add** to enter a ticker such as `0700.HK` or `TSLA`; tap the trash icon to remove a symbol. |
 | **Metals** | Gold, silver, and platinum COMEX futures quotes. |
 | **Setup** | Set saved Wi-Fi credentials or scan nearby Wi-Fi networks. |
@@ -115,7 +132,9 @@ The weather location is fixed in the firmware to **Hong Kong** (`22.30, 114.17`)
 
 | File | Description |
 | --- | --- |
-| [`wifi_stocks_4.cpp`](wifi_stocks_4.cpp) | Current full market-terminal firmware. |
+| [`wifi_stock_ir/wifi_stock_ir.ino`](wifi_stock_ir/wifi_stock_ir.ino) | Current market-terminal and MLX90640 thermal-camera firmware. |
+| [`ir_i2c_debug/ir_i2c_debug.ino`](ir_i2c_debug/ir_i2c_debug.ino) | Standalone MLX90640 I2C connection test. |
+| [`ir_mlx90640_thermal_rotate90_cyd/ir_mlx90640_thermal_rotate90_cyd.ino`](ir_mlx90640_thermal_rotate90_cyd/ir_mlx90640_thermal_rotate90_cyd.ino) | Standalone 90° thermal-display reference/test. |
 | [`define_setting.c`](define_setting.c) | Touch calibration constants/reference mapping. |
 
 ## License
